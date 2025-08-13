@@ -1,244 +1,120 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+from ultralytics import YOLO
 
-class PoseAnalyzer:
-    def __init__(self, 
-                 min_detection_confidence=0.5, 
-                 min_tracking_confidence=0.5,
-                 wrist_nose_threshold=200,
-                 thumb_palm_threshold=50,
-                 wrist_rotation_threshold=5,
-                 elbow_angle_threshold=90):
-        
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence
-        )
-        
-        # Thresholds
-        self.WRIST_NOSE_THRESHOLD = wrist_nose_threshold
-        self.THUMB_PALM_THRESHOLD = thumb_palm_threshold
-        self.WRIST_ROTATION_THRESHOLD = wrist_rotation_threshold
-        self.ELBOW_ANGLE_THRESHOLD = elbow_angle_threshold
-        
-        self.prev_wrist_angle_right = None
-        self.prev_wrist_angle_left = None
-    
-    @staticmethod
-    def calculate_angle(a, b, c):
-        """محاسبه زاویه بین سه نقطه"""
+class PosePhoneDetector:
+    def __init__(self, detection_interval=3):
+        self.pose = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.model = YOLO("yolov8m.pt")  
+        self.detection_interval = detection_interval
+        self.frame_count = 0
+        self.last_detections = []
+
+    def calculate_angle(self, a, b, c):
         a, b, c = np.array(a), np.array(b), np.array(c)
-        radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+        radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - \
+                  np.arctan2(a[1] - b[1], a[0] - b[0])
         angle = np.abs(np.degrees(radians))
         return angle if angle <= 180 else 360 - angle
-    
-    def calculate_wrist_rotation(self, elbow, wrist, prev_angle):
-        """محاسبه چرخش مچ دست"""
-        vec = np.array(wrist) - np.array(elbow)
-        angle = np.degrees(np.arctan2(vec[1], vec[0]))
-        
-        if prev_angle is None:
-            return angle, 0
-        
-        rotation = abs(angle - prev_angle)
-        return angle, rotation
-    
-    def analyze_hand(self, landmarks, side='right', frame_width=None, frame_height=None):
-        """آنالیز وضعیت یک دست"""
-        results = {
-            'status': [],
-            'landmarks': {},
-            'angles': {},
-            'distances': {}
-        }
-        
-        if frame_width is None or frame_height is None:
-            w, h = 1, 1  # مقادیر پیش‌فرض
-        else:
-            w, h = frame_width, frame_height
-        
-        shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER if side == 'left' else self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
-        elbow = landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW if side == 'left' else self.mp_pose.PoseLandmark.RIGHT_ELBOW]
-        wrist = landmarks[self.mp_pose.PoseLandmark.LEFT_WRIST if side == 'left' else self.mp_pose.PoseLandmark.RIGHT_WRIST]
-        thumb = landmarks[self.mp_pose.PoseLandmark.LEFT_THUMB if side == 'left' else self.mp_pose.PoseLandmark.RIGHT_THUMB]
-        pinky = landmarks[self.mp_pose.PoseLandmark.LEFT_PINKY if side == 'left' else self.mp_pose.PoseLandmark.RIGHT_PINKY]
-        
-        key_points = {
-            'shoulder': [shoulder.x * w, shoulder.y * h],
-            'elbow': [elbow.x * w, elbow.y * h],
-            'wrist': [wrist.x * w, wrist.y * h],
-            'thumb': [thumb.x * w, thumb.y * h],
-            'pinky': [pinky.x * w, pinky.y * h]
-        }
-        
-        results['landmarks'] = key_points
-        
-        # محاسبه زاویه آرنج
-        elbow_angle = self.calculate_angle(
-            key_points['shoulder'], 
-            key_points['elbow'], 
-            key_points['wrist']
-        )
-        results['angles']['elbow'] = elbow_angle
-        
-        if elbow_angle < self.ELBOW_ANGLE_THRESHOLD:
-            results['status'].append(f"{side.capitalize()} elbow bent")
-        
-        # محاسبه چرخش مچ دست
-        prev_angle = self.prev_wrist_angle_left if side == 'left' else self.prev_wrist_angle_right
-        wrist_angle, wrist_rotation = self.calculate_wrist_rotation(
-            key_points['elbow'], 
-            key_points['wrist'],
-            prev_angle
-        )
-        
-        if side == 'left':
-            self.prev_wrist_angle_left = wrist_angle
-        else:
-            self.prev_wrist_angle_right = wrist_angle
-            
-        results['angles']['wrist_rotation'] = wrist_rotation
-        
-        if wrist_rotation > self.WRIST_ROTATION_THRESHOLD:
-            results['status'].append(f"{side.capitalize()} wrist rotated")
-        
-        # محاسبه فاصله شست تا کف دست
-        thumb_palm_dist = np.linalg.norm(
-            np.array(key_points['thumb']) - np.array(key_points['pinky'])
-        )
-        results['distances']['thumb_palm'] = thumb_palm_dist
-        
-        if thumb_palm_dist < self.THUMB_PALM_THRESHOLD:
-            results['status'].append(f"{side.capitalize()} thumb near palm")
-        
-        return results
-    
-    def analyze_frame(self, frame):
-        """آنالیز وضعیت بدن در فریم فعلی"""
-        results = {
-            'right_hand': {},
-            'left_hand': {},
-            'nose': None,
-            'status': []
-        }
-        
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pose_results = self.pose.process(image)
-        
-        if not pose_results.pose_landmarks:
-            return results
-        
+
+    def detect_phone(self, frame):
+        self.frame_count += 1
+        if self.frame_count % self.detection_interval != 0:
+            return self.last_detections
+
+        results = self.model(frame, verbose=False)
+        detections = []
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls)
+                label = self.model.names[cls_id]
+                if "phone" in label.lower():
+                    detections.append(box.xyxy[0].cpu().numpy())
+        self.last_detections = detections
+        return detections
+
+    def analyze_pose(self, frame, phone_boxes):
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.pose.process(image_rgb)
+        if not results.pose_landmarks:
+            return frame, "No Pose"
+
         h, w = frame.shape[:2]
-        landmarks = pose_results.pose_landmarks.landmark
-        
-        # نقطه بینی (مشترک برای هر دو دست)
-        nose = [landmarks[self.mp_pose.PoseLandmark.NOSE].x * w,
-               landmarks[self.mp_pose.PoseLandmark.NOSE].y * h]
-        results['nose'] = nose
-        
-        # آنالیز دست راست
-        right_hand = self.analyze_hand(landmarks, 'right', w, h)
-        results['right_hand'] = right_hand
-        
-        # آنالیز دست چپ
-        left_hand = self.analyze_hand(landmarks, 'left', w, h)
-        results['left_hand'] = left_hand
-        
-        # محاسبه فاصله مچ‌ها تا بینی
-        for side in ['right', 'left']:
-            hand = results[f'{side}_hand']
-            if 'wrist' in hand['landmarks']:
-                wrist_nose_dist = np.linalg.norm(
-                    np.array(hand['landmarks']['wrist']) - np.array(nose)
-                )
-                hand['distances']['wrist_nose'] = wrist_nose_dist
-                
-                if wrist_nose_dist < self.WRIST_NOSE_THRESHOLD:
-                    results['status'].append(f"{side.capitalize()} wrist near face")
-        
-        # جمع‌بندی وضعیت‌ها
-        results['status'].extend(right_hand['status'])
-        results['status'].extend(left_hand['status'])
-        
-        return results
+        lm = results.pose_landmarks.landmark
 
-
-class PoseVisualizer:
-    @staticmethod
-    def draw_analysis_results(frame, analysis_results):
-        """رسم نتایج آنالیز روی فریم"""
-        colors = {
-            'right': (0, 255, 0),  # سبز برای دست راست
-            'left': (0, 0, 255)    # قرمز برای دست چپ
+        nose = [lm[mp.solutions.pose.PoseLandmark.NOSE].x,
+                lm[mp.solutions.pose.PoseLandmark.NOSE].y]
+        shoulders = {
+            "left": [lm[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER].x,
+                     lm[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER].y],
+            "right": [lm[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER].x,
+                      lm[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER].y]
         }
-        
-        # رسم خطوط و نقاط برای هر دست
-        for side in ['right', 'left']:
-            hand = analysis_results.get(f'{side}_hand', {})
-            landmarks = hand.get('landmarks', {})
-            
-            if not landmarks:
-                continue
-            
-            color = colors[side]
-            
-            # رسم خطوط بین نقاط
-            connections = [
-                ('shoulder', 'elbow'),
-                ('elbow', 'wrist'),
-                ('wrist', 'thumb'),
-                ('wrist', 'pinky')
-            ]
-            
-            for start, end in connections:
-                if start in landmarks and end in landmarks:
-                    cv2.line(frame, 
-                            (int(landmarks[start][0]), int(landmarks[start][1])),
-                            (int(landmarks[end][0]), int(landmarks[end][1])),
-                            color, 2)
-            
-            # رسم نقاط کلیدی
-            for point in landmarks.values():
-                cv2.circle(frame, (int(point[0]), int(point[1])), 8, color, -1)
-        
-        # نمایش وضعیت
-        status_text = ", ".join(analysis_results.get('status', []))
-        cv2.putText(frame, status_text, (30, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        return frame
+        elbows = {
+            "left": [lm[mp.solutions.pose.PoseLandmark.LEFT_ELBOW].x,
+                     lm[mp.solutions.pose.PoseLandmark.LEFT_ELBOW].y],
+            "right": [lm[mp.solutions.pose.PoseLandmark.RIGHT_ELBOW].x,
+                      lm[mp.solutions.pose.PoseLandmark.RIGHT_ELBOW].y]
+        }
+        wrists = {
+            "left": [lm[mp.solutions.pose.PoseLandmark.LEFT_WRIST].x,
+                     lm[mp.solutions.pose.PoseLandmark.LEFT_WRIST].y],
+            "right": [lm[mp.solutions.pose.PoseLandmark.RIGHT_WRIST].x,
+                      lm[mp.solutions.pose.PoseLandmark.RIGHT_WRIST].y]
+        }
+
+        # خطوط لندمارک: آبی ملایم
+        for side, color in zip(["left", "right"], [(255, 200, 100), (100, 200, 255)]):
+            pts = [shoulders[side], elbows[side], wrists[side]]
+            for i, pt in enumerate(pts):
+                cv2.circle(frame, (int(pt[0] * w), int(pt[1] * h)), 8, color, -1)
+                if i > 0:
+                    cv2.line(frame,
+                             (int(pts[i - 1][0] * w), int(pts[i - 1][1] * h)),
+                             (int(pts[i][0] * w), int(pts[i][1] * h)),
+                             color, 3)
+
+        if not phone_boxes:
+            return frame, "No Phone Detected"
+
+        for box in phone_boxes:
+            x1, y1, x2, y2 = map(int, box)
+            cx, cy = (x1 + x2) / 2 / w, (y1 + y2) / 2 / h
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+
+            for side in ["left", "right"]:
+                elbow_angle = self.calculate_angle(shoulders[side], elbows[side], wrists[side])
+                wrist_face_dist = np.linalg.norm(np.array(wrists[side]) - np.array(nose))
+
+                # شرط: گوشی + خم بودن یا نزدیکی دست به صورت
+                if elbow_angle < 150 or wrist_face_dist < 0.35:
+                    return frame, "Phone Use"
+
+        return frame, "Not Using"
+
+    def run(self):
+        cap = cv2.VideoCapture(0)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            phone_boxes = self.detect_phone(frame)
+            frame, status = self.analyze_pose(frame, phone_boxes)
+
+            # فونت شیک و رنگ سبز برای استفاده
+            font = cv2.FONT_HERSHEY_COMPLEX
+            color = (0, 255, 0) if status == "Phone Use" else (0, 0, 255)
+            cv2.putText(frame, status, (30, 50), font, 1.2, color, 3, cv2.LINE_AA)
+
+            cv2.imshow("Pose & Phone Detection", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    # تنظیمات برای دوربین مداربسته
-    pose_analyzer = PoseAnalyzer(
-        wrist_nose_threshold=250,  
-        thumb_palm_threshold=7,
-        wrist_rotation_threshold=7,
-        elbow_angle_threshold=100
-    )
-    
-    visualizer = PoseVisualizer()
-    
-    # برای دوربین مداربسته می‌توانید از آدرس IP دوربین استفاده کنید
-    cap = cv2.VideoCapture(0)  # یا "rtsp://username:password@ip_address:port"
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # آنالیز فریم
-        analysis = pose_analyzer.analyze_frame(frame)
-        
-        # نمایش نتایج
-        frame = visualizer.draw_analysis_results(frame, analysis)
-        
-        cv2.imshow("Pose Analysis (Right: Green, Left: Red)", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-    
-    cap.release()
-    cv2.destroyAllWindows()
+    PosePhoneDetector().run()
